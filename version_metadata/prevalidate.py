@@ -3,39 +3,94 @@ from .utils import cmn, json2, logger
 
 from . import egautils
 from . import markdown
-from . import exp_semantic_rules
+from . import semantic
+
+from collections import namedtuple
+
+#from . import exp_semantic_rules
 
 
 
 class SchemaParser:
+	@staticmethod
+	def schema_id(jsonschema):
+		return jsonschema['$id'].split('/')[-1].replace('.json', '')
+
+	@staticmethod
+	def dependencies(js):
+		return [e["$ref"].split('/')[-1] for e in js.get("allOf", {}   )]
+
+
 	def __init__(self, jsonschema, cfg=None): 
-		getprop = lambda h, k: (k, h.get(k, "__undef__"))		
+		self.schema_id = SchemaParser.schema_id(jsonschema)
+		self.rules = self.semantic_rules() 
+		self.cfg = cfg
+
+		if self.schema_id in ['experiment']:
+			self.bytype, self.required, self.dependencies  =  self.parse_experiment(jsonschema)
+		elif self.schema_id in ['sample']:
+			self.bytype, self.required, self.dependencies  = self.parse_sample(jsonschema)
+		else:
+			raise Exception(self.schema_id)
+
+		Constraint = namedtuple('Constraint', ['rules', 'required', 'dependencies'])	
+		self.constraints =  {k : Constraint(self.rules.get(k, {}), self.required.get(k, {}), self.dependencies.get(k, {})     ) for k in self.bytype}
+
+	def parse_properties(self, properties):
 		property_attrs = ["type" , "minItems", "maxItems"]
-		bytype = dict()
+		getprop = lambda h, k: (k, h.get(k, "__undef__"))
+		parsed = {p :   cmn.safedict([ getprop(properties[p], e) for e in property_attrs]) for p in properties}
+		for p in properties:
+			item_attr = properties[p].get("items", {})
+			parsed[p]["description"] = item_attr.get("description", "_undef_")
+			parsed[p]["enum"] = item_attr.get("enum", "")
+		return parsed
+
+	def parse_sample(self, js):
+		bytype, required, dependencies = dict(), dict(), dict()
+		
+		assert list(js['definitions'].keys()) == ['donor'], js['definitions']
+
+		for defn in js['definitions']:
+			properties = js['definitions'][defn]['properties']
+			bytype[defn] =  self.parse_properties(properties)   
+			required[defn] = js['definitions'][defn]['required']
+			dependencies[defn] = SchemaParser.dependencies(js['definitions'][defn])
+
+		for subtype in js["allOf"]:
+			print(subtype)
+			biomaterial_type = subtype['if']['properties']['biomaterial_type']["const"]
+			assert biomaterial_type in ["Cell Line",  "Primary Cell", "Primary Cell Culture", "Primary Tissue"]
+			properties = subtype["then"]["properties"]
+			bytype[biomaterial_type] = self.parse_properties(properties) 
+			required[biomaterial_type] = subtype["then"]["required"]
+			dependencies[biomaterial_type] = SchemaParser.dependencies(subtype["then"])
+	
+		return bytype, required, dependencies 
+	
+
+	def parse_experiment(self, jsonschema):
+		bytype, required, dependencies = dict(), dict(), dict()
 		for defn in jsonschema['definitions']:
 			assert not defn in bytype
-			if not cfg:
+			if not self.cfg:
 				bytype[defn] = list(jsonschema['definitions'][defn]['properties'].keys())
 			else:
 				properties = jsonschema['definitions'][defn]['properties']
-				bytype[defn] = {p :   cmn.safedict([ getprop(properties[p], e) for e in property_attrs]) for p in properties}
-				for p in properties:
-					item_attr = properties[p].get("items", {})
-					bytype[defn][p]["description"] = item_attr.get("description", "_undef_")
-					bytype[defn][p]["enum"] = item_attr.get("enum", "")
+				bytype[defn] =  self.parse_properties(properties)   #  {p :   cmn.safedict([ getprop(properties[p], e) for e in property_attrs]) for p in properties}
 
-		self.rules = self.semantic_rules() 
-		self.bytype = bytype
+		common = {e : jsonschema['properties'][e] for e in jsonschema['properties']}
+		return bytype, required, dependencies
 		
 	def definitions(self):
 		return self.bytype
 		
 	def semantic_rules(self):
 		data = dict()
-		rules = [e for e in dir(exp_semantic_rules) if e.startswith('rule_')]
+		rules =  semantic.rules(self.schema_id) #  [e for e in dir(exp_semantic_rules) if e.startswith('rule_')]
 		for r in rules:
-			f = getattr(exp_semantic_rules, r)
-			data[r] = json2.loads(f.__doc__)
+			data[r] = semantic.experiment_rule_desc(r)
+		
 		ruleshash = dict()
 		for r in data.values():
 			print(r)
@@ -49,8 +104,7 @@ class SchemaParser:
 		txt = []
 		print(self.rules)
 		for k in sorted(self.bytype.keys()):
-			txt.append(markdown.markdown(k, self.bytype[k], self.rules.get(k, {})))
-			print(k, self.rules, 'XX')
+			txt.append(markdown.markdown(k, self.bytype[k], self.constraints[k], self.schema_id))
 		return '\n'.join(txt) + '\n\n'
 
 
@@ -61,7 +115,7 @@ class Prevalidate:
 		assert len(jsonschemas) == 1 # no more lists here
 		#for jsonschema in self.jsonschemas:
 		jsonschema = jsonschemas[0]
-		self.schema_id = jsonschema['$id'].split('/')[-1].replace('.json', '')
+		self.schema_id = SchemaParser.schema_id(jsonschema)   #jsonschema['$id'].split('/')[-1].replace('.json', '')
 		assert self.schema_id in ['experiment', 'sample']
 		self.bytype = SchemaParser(jsonschema).definitions()
 		self.version = version
@@ -131,14 +185,18 @@ class Prevalidate:
 			return True, {'__warn__' : 'prevalidation ignored'}
 
 
-if __name__ == '__main__':
-	schemafile = '../schemas/json/1.1/experiment.json'
-	parser = SchemaParser(json2.loadf(schemafile) , True)
-	#json2.pp([parser.bytype, parser.rules])
-	print(cmn.dumpf('experiment_attributes.md', parser.md()))
+def main(args):
+	schemas = {'1.0':  ['./schemas/json/1.0/experiment.json', './schemas/json/1.0/sample.json']}
+	for schemafile in schemas["1.0"]:
+		parser = SchemaParser(json2.loadf(schemafile) , True)
+		outfile = cmn.basename(schemafile) + ".md" 
+		print("outfile:", outfile)
+		print(cmn.dumpf(outfile, parser.md()))
 
 	
 
+if __name__ == '__main__':
+	main()
 
 
 
