@@ -9,7 +9,7 @@ from collections import namedtuple
 
 #from . import exp_semantic_rules
 
-
+Constraint = namedtuple('Constraint', ['rules', 'required', 'dependencies', 'properties'])
 
 class SchemaParser:
 	@staticmethod
@@ -27,16 +27,17 @@ class SchemaParser:
 		self.cfg = cfg
 
 		if self.schema_id in ['experiment']:
-			self.bytype, self.required, self.dependencies  =  self.parse_experiment(jsonschema)
+			self.constraints  =  self.experiment(jsonschema)
 		elif self.schema_id in ['sample']:
-			self.bytype, self.required, self.dependencies  = self.parse_sample(jsonschema)
+			self.constraints  = self.sample(jsonschema)
 		else:
 			raise Exception(self.schema_id)
 
-		Constraint = namedtuple('Constraint', ['rules', 'required', 'dependencies'])	
-		self.constraints =  {k : Constraint(self.rules.get(k, {}), self.required.get(k, {}), self.dependencies.get(k, {})     ) for k in self.bytype}
+		self.bytype = {k: self.constraints[k].properties for k in self.constraints}
 
-	def parse_properties(self, properties):
+
+	@staticmethod
+	def properties(properties):
 		property_attrs = ["type" , "minItems", "maxItems"]
 		getprop = lambda h, k: (k, h.get(k, "__undef__"))
 		parsed = {p :   cmn.safedict([ getprop(properties[p], e) for e in property_attrs]) for p in properties}
@@ -46,14 +47,15 @@ class SchemaParser:
 			parsed[p]["enum"] = item_attr.get("enum", "")
 		return parsed
 
-	def parse_sample(self, js):
+	def sample(self, js):
+		rules = self.semantic_rules()
 		bytype, required, dependencies = dict(), dict(), dict()
 		
 		assert list(js['definitions'].keys()) == ['donor'], js['definitions']
 
 		for defn in js['definitions']:
 			properties = js['definitions'][defn]['properties']
-			bytype[defn] =  self.parse_properties(properties)   
+			bytype[defn] =  SchemaParser.properties(properties)   
 			required[defn] = js['definitions'][defn]['required']
 			dependencies[defn] = SchemaParser.dependencies(js['definitions'][defn])
 
@@ -62,14 +64,17 @@ class SchemaParser:
 			biomaterial_type = subtype['if']['properties']['biomaterial_type']["const"]
 			assert biomaterial_type in ["Cell Line",  "Primary Cell", "Primary Cell Culture", "Primary Tissue"]
 			properties = subtype["then"]["properties"]
-			bytype[biomaterial_type] = self.parse_properties(properties) 
+			bytype[biomaterial_type] = SchemaParser.properties(properties) 
 			required[biomaterial_type] = subtype["then"]["required"]
 			dependencies[biomaterial_type] = SchemaParser.dependencies(subtype["then"])
 	
-		return bytype, required, dependencies 
+		return { k: Constraint(rules.get(k, {}), required.get(k, {}), dependencies.get(k, {}), bytype[k] )  for k in bytype}
+
+		
 	
 
-	def parse_experiment(self, jsonschema):
+	def experiment(self, jsonschema):
+		rules = self.semantic_rules()
 		bytype, required, dependencies = dict(), dict(), dict()
 		for defn in jsonschema['definitions']:
 			assert not defn in bytype
@@ -77,13 +82,13 @@ class SchemaParser:
 				bytype[defn] = list(jsonschema['definitions'][defn]['properties'].keys())
 			else:
 				properties = jsonschema['definitions'][defn]['properties']
-				bytype[defn] =  self.parse_properties(properties)   #  {p :   cmn.safedict([ getprop(properties[p], e) for e in property_attrs]) for p in properties}
+				bytype[defn] =  SchemaParser.properties(properties)   #  {p :   cmn.safedict([ getprop(properties[p], e) for e in property_attrs]) for p in properties}
 
 		common = {e : jsonschema['properties'][e] for e in jsonschema['properties']}
-		return bytype, required, dependencies
+		return { k: Constraint(rules.get(k, {}), required.get(k, {}), dependencies.get(k, {}), bytype[k] )  for k in bytype}
 		
 	def definitions(self):
-		return self.bytype
+		return self.constraints.properties
 		
 	def semantic_rules(self):
 		data = dict()
@@ -187,11 +192,12 @@ class Prevalidate:
 
 def main(args):
 	schemas = {'1.0':  ['./schemas/json/1.0/experiment.json', './schemas/json/1.0/sample.json']}
-	for schemafile in schemas["1.0"]:
-		parser = SchemaParser(json2.loadf(schemafile) , True)
-		outfile = cmn.basename(schemafile) + ".md" 
-		print("outfile:", outfile)
-		print(cmn.dumpf(outfile, parser.md()))
+	for version, schemafiles in schemas.items():
+		for schemafile in schemafiles:	
+			parser = SchemaParser(json2.loadf(schemafile) , True)
+			outfile = cmn.basename(schemafile) + ".md" 
+			print("outfile:", './docs/' + outfile.replace('.json', '_' + version + '.md'))
+			print(cmn.dumpf(outfile, parser.md()))
 
 	
 
